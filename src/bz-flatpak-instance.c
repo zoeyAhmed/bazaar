@@ -897,6 +897,8 @@ load_local_ref_fiber (LoadLocalRefData *data)
   g_autoptr (GInputStream) stream_gz         = NULL;
   g_autoptr (GInputStream) stream_data       = NULL;
   g_autoptr (GZlibDecompressor) decompressor = NULL;
+  g_autoptr (GFile) bundle_cache_file        = NULL;
+
 
   uri  = g_file_get_uri (file);
   path = g_file_get_path (file);
@@ -963,6 +965,45 @@ load_local_ref_fiber (LoadLocalRefData *data)
       return dex_future_new_take_string (g_steal_pointer (&name));
     }
 
+  /* This check is neccessary because libflatpak can not install straight
+   * from the path of the bundle given to us by the file
+   * picker portal, so we must copy the bundle to bazaar's cache, which
+   * libflatpak has access too.
+   */
+  if (path != NULL && strstr (path, "/run/user") != NULL)
+    {
+      g_autofree char *basename    = NULL;
+      g_autofree char *bundles_dir = NULL;
+      g_autofree char *tmp_path    = NULL;
+
+      basename    = g_file_get_basename (file);
+      bundles_dir = g_build_filename (g_get_user_cache_dir (), "bundles", NULL);
+      tmp_path    = g_build_filename (bundles_dir, basename, NULL);
+
+      if (g_mkdir_with_parents (bundles_dir, 0755) != 0)
+        return dex_future_new_reject (
+          BZ_FLATPAK_ERROR,
+          BZ_FLATPAK_ERROR_IO_MISBEHAVIOR,
+          "Failed to create bundle cache directory '%s'",
+          bundles_dir);
+
+      bundle_cache_file = g_file_new_for_path (tmp_path);
+      if (!g_file_copy (file, bundle_cache_file,
+        G_FILE_COPY_OVERWRITE,
+        data->cancellable,
+        NULL, NULL,
+        &local_error))
+        return dex_future_new_reject (
+          BZ_FLATPAK_ERROR,
+          BZ_FLATPAK_ERROR_IO_MISBEHAVIOR,
+          "Failed to copy bundle out of portal path '%s': %s",
+          path, local_error->message);
+
+      g_free (path);
+      path = g_steal_pointer (&tmp_path);
+      file = bundle_cache_file;
+    }
+
   bref = flatpak_bundle_ref_new (file, &local_error);
   if (bref == NULL)
     return dex_future_new_reject (
@@ -1022,6 +1063,7 @@ load_local_ref_fiber (LoadLocalRefData *data)
       component,
       NULL,
       &local_error);
+
   if (entry == NULL)
     return dex_future_new_reject (
         BZ_FLATPAK_ERROR,
@@ -1810,11 +1852,13 @@ transaction_fiber (TransactionData *data)
           gboolean         is_user                   = FALSE;
           g_autofree char *ref_fmt                   = NULL;
           g_autoptr (FlatpakTransaction) transaction = NULL;
+          gboolean         is_bundle                 = FALSE;
 
           entry   = g_ptr_array_index (installations, i);
           ref     = bz_flatpak_entry_get_ref (entry);
           is_user = bz_flatpak_entry_is_user (BZ_FLATPAK_ENTRY (entry));
           ref_fmt = flatpak_ref_format_ref (ref);
+          is_bundle = FLATPAK_IS_BUNDLE_REF (ref);
 
           if ((is_user && self->user == NULL) ||
               (!is_user && self->system == NULL))
@@ -1843,12 +1887,20 @@ transaction_fiber (TransactionData *data)
                   local_error->message);
             }
 
-          result = flatpak_transaction_add_install (
-              transaction,
-              bz_entry_get_remote_repo_name (BZ_ENTRY (entry)),
-              ref_fmt,
-              NULL,
-              &local_error);
+          if (is_bundle)
+            result = flatpak_transaction_add_install_bundle (
+                transaction,
+                flatpak_bundle_ref_get_file (FLATPAK_BUNDLE_REF (ref)),
+                NULL,
+                &local_error);
+          else
+            result = flatpak_transaction_add_install (
+                transaction,
+                bz_entry_get_remote_repo_name (BZ_ENTRY (entry)),
+                ref_fmt,
+                NULL,
+                &local_error);
+
           if (!result)
             {
               dex_channel_close_send (channel);

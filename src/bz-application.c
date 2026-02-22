@@ -1287,6 +1287,48 @@ respond_to_flatpak_fiber (RespondToFlatpakData *data)
           }
           break;
         case BZ_BACKEND_NOTIFICATION_KIND_INSTALL_DONE:
+          {
+            const char *unique_id     = NULL;
+            g_autoptr (BzEntry) entry = NULL;
+            const char *version       = NULL;
+
+            unique_id = bz_backend_notification_get_unique_id (notif);
+            entry     = dex_await_object (
+              bz_entry_cache_manager_get (self->cache, unique_id),
+                                          &local_error);
+            version = bz_backend_notification_get_version (notif);
+
+            if (entry == NULL)
+              {
+                g_warning ("Backend notification references an entry "
+                           "which couldn't be decached: %s",
+                           local_error->message);
+                break;
+              }
+            else
+              {
+                g_hash_table_replace (self->installed_set, g_strdup (unique_id), g_strdup (version));
+                bz_entry_set_installed_version (entry, version);
+                bz_entry_set_installed (entry, TRUE);
+
+                if (bz_entry_is_of_kinds (entry, BZ_ENTRY_KIND_APPLICATION))
+                  {
+                    BzEntryGroup *group = NULL;
+
+                    group = g_hash_table_lookup (self->ids_to_groups, bz_entry_get_id (entry));
+                    if (group != NULL)
+                    {
+                      gboolean found    = FALSE;
+                      guint    position = 0;
+
+                      found = g_list_store_find (self->installed_apps, group, &position);
+                      if (!found)
+                        g_list_store_insert_sorted (self->installed_apps, group, (GCompareDataFunc) cmp_group, NULL);
+                    }
+                  }
+              }
+            break;
+          }
         case BZ_BACKEND_NOTIFICATION_KIND_UPDATE_DONE:
         case BZ_BACKEND_NOTIFICATION_KIND_REMOVE_DONE:
           {
@@ -1308,32 +1350,6 @@ respond_to_flatpak_fiber (RespondToFlatpakData *data)
             switch (kind)
               {
               case BZ_BACKEND_NOTIFICATION_KIND_INSTALL_DONE:
-                {
-                  const char *version = NULL;
-
-                  version = bz_backend_notification_get_version (notif);
-
-                  g_hash_table_replace (self->installed_set, g_strdup (unique_id), g_strdup (version));
-                  bz_entry_set_installed_version (entry, version);
-                  bz_entry_set_installed (entry, TRUE);
-
-                  if (bz_entry_is_of_kinds (entry, BZ_ENTRY_KIND_APPLICATION))
-                    {
-                      BzEntryGroup *group = NULL;
-
-                      group = g_hash_table_lookup (self->ids_to_groups, bz_entry_get_id (entry));
-                      if (group != NULL)
-                        {
-                          gboolean found    = FALSE;
-                          guint    position = 0;
-
-                          found = g_list_store_find (self->installed_apps, group, &position);
-                          if (!found)
-                            g_list_store_insert_sorted (self->installed_apps, group, (GCompareDataFunc) cmp_group, NULL);
-                        }
-                    }
-                }
-                break;
               case BZ_BACKEND_NOTIFICATION_KIND_UPDATE_DONE:
                 {
                   const char *version = NULL;
