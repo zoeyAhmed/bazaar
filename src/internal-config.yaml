@@ -18,7 +18,7 @@ search-biases:
       - org.gnome.Boxes
 
   - regex: (?i)ide
-    convert-to: development
+    convert-to: develop
     boost-appids:
       - com.visualstudio.code
       - com.vscodium.codium
