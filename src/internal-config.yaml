@@ -11,5 +11,17 @@ search-biases:
       - org.mozilla.firefox
       - org.torproject.torbrowser-launcher
 
+  - regex: (?i)vm
+    convert-to: virtual machine
+    boost-appids:
+      - org.virt_manager.virt-manager
+      - org.gnome.Boxes
+
+  - regex: (?i)ide
+    convert-to: development
+    boost-appids:
+      - org.gnome.Builder
+      - org.kde.kdevelop
+
   - regex: (?i)yt
     convert-to: youtube
