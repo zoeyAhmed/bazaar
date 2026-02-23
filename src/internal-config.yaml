@@ -1,0 +1,15 @@
+search-biases:
+  # `(?i)` means case insensitive
+  - regex: (?i)browser
+    convert-to: web browser
+    boost-appids:
+      - app.zen_browser.zen
+      - io.github.ungoogled_software.ungoogled_chromium
+      - org.chromium.Chromium
+      - org.gnome.Epiphany
+      - org.kde.falkon
+      - org.mozilla.firefox
+      - org.torproject.torbrowser-launcher
+
+  - regex: (?i)yt
+    convert-to: youtube

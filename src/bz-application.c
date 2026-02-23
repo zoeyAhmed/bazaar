@@ -45,6 +45,7 @@
 #include "bz-gnome-shell-search-provider.h"
 #include "bz-hash-table-object.h"
 #include "bz-inspector.h"
+#include "bz-internal-config.h"
 #include "bz-io.h"
 #include "bz-login-page.h"
 #include "bz-newline-parser.h"
@@ -75,6 +76,7 @@ struct _BzApplication
   BzFlathubState             *tmp_flathub;
   BzFlatpakInstance          *flatpak;
   BzGnomeShellSearchProvider *gs_search;
+  BzInternalConfig           *internal_config;
   BzMainConfig               *config;
   BzNewlineParser            *txt_blocklist_parser;
   BzSearchEngine             *search_engine;
@@ -345,6 +347,7 @@ bz_application_dispose (GObject *object)
   g_clear_object (&self->groups);
   g_clear_object (&self->gs_search);
   g_clear_object (&self->installed_apps);
+  g_clear_object (&self->internal_config);
   g_clear_object (&self->network);
   g_clear_object (&self->search_engine);
   g_clear_object (&self->settings);
@@ -2456,15 +2459,35 @@ init_service_struct (BzApplication *self,
                      GtkStringList *txt_blocklists,
                      GtkStringList *curated_configs)
 {
-  const char *app_id = NULL;
+  g_autoptr (GError) local_error                       = NULL;
+  g_autoptr (GBytes) internal_config_bytes             = NULL;
+  g_autoptr (BzYamlParser) internal_config_parser      = NULL;
+  g_autoptr (GHashTable) internal_config_parse_results = NULL;
+  const char *app_id                                   = NULL;
 #ifdef HARDCODED_MAIN_CONFIG
-  g_autoptr (GError) local_error  = NULL;
   g_autoptr (GFile) config_file   = NULL;
   g_autoptr (GBytes) config_bytes = NULL;
 #endif
   GtkCustomFilter *filter            = NULL;
   GNetworkMonitor *network           = NULL;
   g_autoptr (BzAuthState) auth_state = NULL;
+
+  g_type_ensure (BZ_TYPE_INTERNAL_CONFIG);
+  internal_config_bytes = g_resources_lookup_data (
+      "/io/github/kolunmi/Bazaar/internal-config.yaml",
+      G_RESOURCE_LOOKUP_FLAGS_NONE,
+      NULL);
+  g_assert (internal_config_bytes != NULL);
+  internal_config_parser = bz_yaml_parser_new_for_resource_schema (
+      "/io/github/kolunmi/Bazaar/internal-config-schema.xml");
+  g_assert (internal_config_parser != NULL);
+  internal_config_parse_results = bz_parser_process_bytes (
+      BZ_PARSER (internal_config_parser), internal_config_bytes, &local_error);
+  if (internal_config_parse_results == NULL)
+    g_critical ("FATAL: unable to parse internal config resource: %s",
+                local_error->message);
+  g_assert (internal_config_parse_results != NULL);
+  self->internal_config = g_value_dup_object (g_hash_table_lookup (internal_config_parse_results, "/"));
 
   g_type_ensure (BZ_TYPE_MAIN_CONFIG);
 #ifdef HARDCODED_MAIN_CONFIG
@@ -2507,8 +2530,11 @@ init_service_struct (BzApplication *self,
             }
         }
       else
-        g_warning ("Could not load main config at %s: %s",
-                   HARDCODED_MAIN_CONFIG, local_error->message);
+        {
+          g_warning ("Could not load main config at %s: %s",
+                     HARDCODED_MAIN_CONFIG, local_error->message);
+          g_clear_error (&local_error);
+        }
     }
   g_clear_error (&local_error);
 #endif
@@ -2739,6 +2765,7 @@ init_service_struct (BzApplication *self,
       g_object_ref (GTK_FILTER (self->group_filter)));
 
   self->search_engine = bz_search_engine_new ();
+  bz_search_engine_set_internal_config (self->search_engine, self->internal_config);
   bz_search_engine_set_model (self->search_engine, G_LIST_MODEL (self->group_filter_model));
   bz_gnome_shell_search_provider_set_engine (self->gs_search, self->search_engine);
 

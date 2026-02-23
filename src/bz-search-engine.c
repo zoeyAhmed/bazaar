@@ -28,7 +28,10 @@ struct _BzSearchEngine
 {
   GObject parent_instance;
 
-  GListModel *model;
+  BzInternalConfig *internal_config;
+  GListModel       *model;
+
+  GPtrArray *bias_regexes;
 };
 
 G_DEFINE_FINAL_TYPE (BzSearchEngine, bz_search_engine, G_TYPE_OBJECT);
@@ -37,6 +40,7 @@ enum
 {
   PROP_0,
 
+  PROP_INTERNAL_CONFIG,
   PROP_MODEL,
 
   LAST_PROP
@@ -65,14 +69,28 @@ cmp_scores (Score *a,
 #define NO_MATCH       0.0
 
 BZ_DEFINE_DATA (
+    bias,
+    Bias,
+    {
+      GRegex     *regex;
+      char       *convert_to;
+      GHashTable *boost;
+    },
+    BZ_RELEASE_DATA (regex, g_regex_unref);
+    BZ_RELEASE_DATA (convert_to, g_free);
+    BZ_RELEASE_DATA (boost, g_hash_table_unref));
+
+BZ_DEFINE_DATA (
     query_task,
     QueryTask,
     {
       char     **terms;
       GPtrArray *snapshot;
+      GPtrArray *biases;
     },
     BZ_RELEASE_DATA (terms, g_strfreev);
-    BZ_RELEASE_DATA (snapshot, g_ptr_array_unref))
+    BZ_RELEASE_DATA (snapshot, g_ptr_array_unref);
+    BZ_RELEASE_DATA (biases, g_ptr_array_unref))
 static DexFuture *
 query_task_fiber (QueryTaskData *data);
 
@@ -85,9 +103,11 @@ BZ_DEFINE_DATA (
       double     threshold;
       guint      work_offset;
       guint      work_length;
+      GPtrArray *active_biases;
     },
     BZ_RELEASE_DATA (query_utf8, g_free);
-    BZ_RELEASE_DATA (shallow_mirror, g_ptr_array_unref));
+    BZ_RELEASE_DATA (shallow_mirror, g_ptr_array_unref);
+    BZ_RELEASE_DATA (active_biases, g_ptr_array_unref));
 static DexFuture *
 query_sub_task_fiber (QuerySubTaskData *data);
 
@@ -105,7 +125,10 @@ bz_search_engine_dispose (GObject *object)
 {
   BzSearchEngine *self = BZ_SEARCH_ENGINE (object);
 
+  g_clear_object (&self->internal_config);
   g_clear_object (&self->model);
+
+  g_clear_pointer (&self->bias_regexes, g_ptr_array_unref);
 
   G_OBJECT_CLASS (bz_search_engine_parent_class)->dispose (object);
 }
@@ -120,6 +143,9 @@ bz_search_engine_get_property (GObject    *object,
 
   switch (prop_id)
     {
+    case PROP_INTERNAL_CONFIG:
+      g_value_set_object (value, bz_search_engine_get_internal_config (self));
+      break;
     case PROP_MODEL:
       g_value_set_object (value, bz_search_engine_get_model (self));
       break;
@@ -138,6 +164,9 @@ bz_search_engine_set_property (GObject      *object,
 
   switch (prop_id)
     {
+    case PROP_INTERNAL_CONFIG:
+      bz_search_engine_set_internal_config (self, g_value_get_object (value));
+      break;
     case PROP_MODEL:
       bz_search_engine_set_model (self, g_value_get_object (value));
       break;
@@ -155,6 +184,13 @@ bz_search_engine_class_init (BzSearchEngineClass *klass)
   object_class->get_property = bz_search_engine_get_property;
   object_class->dispose      = bz_search_engine_dispose;
 
+  props[PROP_INTERNAL_CONFIG] =
+      g_param_spec_object (
+          "internal-config",
+          NULL, NULL,
+          BZ_TYPE_INTERNAL_CONFIG,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_EXPLICIT_NOTIFY);
+
   props[PROP_MODEL] =
       g_param_spec_object (
           "model",
@@ -168,12 +204,110 @@ bz_search_engine_class_init (BzSearchEngineClass *klass)
 static void
 bz_search_engine_init (BzSearchEngine *self)
 {
+  self->bias_regexes = g_ptr_array_new_with_free_func (bias_data_unref);
 }
 
 BzSearchEngine *
 bz_search_engine_new (void)
 {
   return g_object_new (BZ_TYPE_SEARCH_ENGINE, NULL);
+}
+
+BzInternalConfig *
+bz_search_engine_get_internal_config (BzSearchEngine *self)
+{
+  g_return_val_if_fail (BZ_IS_SEARCH_ENGINE (self), NULL);
+  return self->internal_config;
+}
+
+void
+bz_search_engine_set_internal_config (BzSearchEngine   *self,
+                                      BzInternalConfig *internal_config)
+{
+  g_return_if_fail (BZ_IS_SEARCH_ENGINE (self));
+  g_return_if_fail (internal_config == NULL || BZ_IS_INTERNAL_CONFIG (internal_config));
+
+  g_clear_object (&self->internal_config);
+  g_ptr_array_set_size (self->bias_regexes, 0);
+
+  if (internal_config != NULL)
+    {
+      GListModel *biases   = NULL;
+      guint       n_biases = 0;
+
+      self->internal_config = g_object_ref (internal_config);
+
+      biases = bz_internal_config_get_search_biases (internal_config);
+      if (biases != NULL)
+        n_biases = g_list_model_get_n_items (biases);
+
+      for (guint i = 0; i < n_biases; i++)
+        {
+          g_autoptr (GError) local_error  = NULL;
+          g_autoptr (BzSearchBias) bias   = NULL;
+          const char      *regex_string   = NULL;
+          const char      *convert_to     = NULL;
+          GListModel      *boost_appids   = NULL;
+          g_autofree char *bounded_string = NULL;
+          g_autoptr (GRegex) regex        = NULL;
+          g_autoptr (GHashTable) boost    = NULL;
+          g_autoptr (BiasData) data       = NULL;
+
+          bias         = g_list_model_get_item (biases, i);
+          regex_string = bz_search_bias_get_regex (bias);
+          convert_to   = bz_search_bias_get_convert_to (bias);
+          boost_appids = bz_search_bias_get_boost_appids (bias);
+          if (regex_string == NULL ||
+              (convert_to == NULL &&
+               boost_appids == NULL))
+            {
+              g_critical ("Internal search bias is incomplete!");
+              continue;
+            }
+
+          bounded_string = g_strdup_printf ("^(%s)$", regex_string);
+          regex          = g_regex_new (
+              bounded_string,
+              G_REGEX_OPTIMIZE,
+              G_REGEX_MATCH_DEFAULT,
+              &local_error);
+          if (regex == NULL)
+            {
+              g_critical ("Internal regex \"%s\" is invalid: %s",
+                          bounded_string, local_error->message);
+              continue;
+            }
+
+          if (boost_appids != NULL)
+            {
+              guint n_appids = 0;
+
+              n_appids = g_list_model_get_n_items (boost_appids);
+              if (n_appids > 0)
+                {
+                  boost = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+                  for (guint j = 0; j < n_appids; j++)
+                    {
+                      g_autoptr (GtkStringObject) string = NULL;
+                      const char *appid                  = NULL;
+
+                      string = g_list_model_get_item (boost_appids, j);
+                      appid  = gtk_string_object_get_string (string);
+                      g_hash_table_replace (boost, g_strdup (appid), NULL);
+                    }
+                }
+            }
+
+          data             = bias_data_new ();
+          data->regex      = g_regex_ref (regex);
+          data->convert_to = bz_maybe_strdup (convert_to);
+          data->boost      = bz_maybe_ref (boost, g_hash_table_ref);
+          g_ptr_array_add (self->bias_regexes, bias_data_ref (data));
+        }
+    }
+
+  g_object_notify_by_pspec (G_OBJECT (self), props[PROP_INTERNAL_CONFIG]);
 }
 
 GListModel *
@@ -249,6 +383,7 @@ bz_search_engine_query (BzSearchEngine    *self,
       data           = query_task_data_new ();
       data->terms    = g_strdupv ((gchar **) terms);
       data->snapshot = g_steal_pointer (&snapshot);
+      data->biases   = g_ptr_array_ref (self->bias_regexes);
 
       return dex_scheduler_spawn (
           dex_thread_pool_scheduler_get_default (),
@@ -261,16 +396,39 @@ bz_search_engine_query (BzSearchEngine    *self,
 static DexFuture *
 query_task_fiber (QueryTaskData *data)
 {
-  char     **terms                  = data->terms;
-  GPtrArray *shallow_mirror         = data->snapshot;
-  g_autoptr (GError) local_error    = NULL;
-  gboolean         result           = FALSE;
-  g_autofree char *query_utf8       = NULL;
-  guint            n_sub_tasks      = 0;
-  guint            scores_per_task  = 0;
-  g_autoptr (GPtrArray) sub_futures = NULL;
-  g_autoptr (GArray) scores         = NULL;
-  g_autoptr (GPtrArray) results     = NULL;
+  char     **terms                    = data->terms;
+  GPtrArray *shallow_mirror           = data->snapshot;
+  GPtrArray *biases                   = data->biases;
+  g_autoptr (GError) local_error      = NULL;
+  gboolean result                     = FALSE;
+  g_autoptr (GPtrArray) active_biases = NULL;
+  g_autofree char *query_utf8         = NULL;
+  guint            n_sub_tasks        = 0;
+  guint            scores_per_task    = 0;
+  g_autoptr (GPtrArray) sub_futures   = NULL;
+  g_autoptr (GArray) scores           = NULL;
+  g_autoptr (GPtrArray) results       = NULL;
+
+  active_biases = g_ptr_array_new_with_free_func (bias_data_unref);
+  if (biases->len > 0)
+    {
+      for (guint i = 0; terms[i] != NULL; i++)
+        {
+          for (guint j = 0; j < biases->len; j++)
+            {
+              BiasData *bias = NULL;
+
+              bias = g_ptr_array_index (biases, j);
+              if (!g_regex_match (bias->regex, terms[i], G_REGEX_MATCH_DEFAULT, NULL))
+                continue;
+
+              g_ptr_array_add (active_biases, bias_data_ref (bias));
+
+              g_clear_pointer (&terms[i], g_free);
+              terms[i] = g_strdup (bias->convert_to);
+            }
+        }
+    }
 
   query_utf8      = g_strjoinv (" ", terms);
   n_sub_tasks     = MAX (1, MIN (shallow_mirror->len / 512, g_get_num_processors ()));
@@ -288,6 +446,7 @@ query_task_fiber (QueryTaskData *data)
       sub_data->threshold      = 1.0;
       sub_data->work_offset    = i * scores_per_task;
       sub_data->work_length    = scores_per_task;
+      sub_data->active_biases  = g_ptr_array_ref (active_biases);
 
       if (i >= n_sub_tasks - 1)
         sub_data->work_length += shallow_mirror->len % n_sub_tasks;
@@ -355,6 +514,7 @@ query_sub_task_fiber (QuerySubTaskData *data)
   double     threshold          = data->threshold;
   guint      work_offset        = data->work_offset;
   guint      work_length        = data->work_length;
+  GPtrArray *active_biases      = data->active_biases;
   g_autoptr (GArray) scores_out = NULL;
 
   scores_out = g_array_new (FALSE, FALSE, sizeof (Score));
@@ -399,6 +559,18 @@ query_sub_task_fiber (QuerySubTaskData *data)
           score += EVALUATE_STRING (search_tokens, -1) * 1.5;
 
 #undef EVALUATE_STRING
+        }
+
+      for (guint j = 0; j < active_biases->len; j++)
+        {
+          BiasData *bias = NULL;
+
+          bias = g_ptr_array_index (active_biases, j);
+          if (bias->boost == NULL)
+            continue;
+
+          if (g_hash_table_contains (bias->boost, id))
+            score *= 2.0;
         }
 
       if (score > threshold)
