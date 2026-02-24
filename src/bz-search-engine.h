@@ -23,8 +23,6 @@
 #include <gtk/gtk.h>
 #include <libdex.h>
 
-#include "bz-internal-config.h"
-
 G_BEGIN_DECLS
 
 #define BZ_TYPE_SEARCH_ENGINE (bz_search_engine_get_type ())
@@ -33,19 +31,19 @@ G_DECLARE_FINAL_TYPE (BzSearchEngine, bz_search_engine, BZ, SEARCH_ENGINE, GObje
 BzSearchEngine *
 bz_search_engine_new (void);
 
-BzInternalConfig *
-bz_search_engine_get_internal_config (BzSearchEngine *self);
-
-void
-bz_search_engine_set_internal_config (BzSearchEngine   *self,
-                                      BzInternalConfig *internal_config);
-
 GListModel *
 bz_search_engine_get_model (BzSearchEngine *self);
 
 void
 bz_search_engine_set_model (BzSearchEngine *self,
                             GListModel     *model);
+
+GListModel *
+bz_search_engine_get_biases (BzSearchEngine *self);
+
+void
+bz_search_engine_set_biases (BzSearchEngine *self,
+                             GListModel     *biases);
 
 DexFuture *
 bz_search_engine_query (BzSearchEngine    *self,

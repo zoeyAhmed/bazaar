@@ -18,6 +18,8 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#define G_LOG_DOMAIN "BAZAAR::SEARCH-ENGINE"
+
 #include "bz-search-engine.h"
 #include "bz-entry-group.h"
 #include "bz-env.h"
@@ -29,10 +31,10 @@ struct _BzSearchEngine
 {
   GObject parent_instance;
 
-  BzInternalConfig *internal_config;
-  GListModel       *model;
+  GListModel *model;
+  GListModel *biases;
 
-  GPtrArray *biases;
+  GPtrArray *biases_mirror;
 };
 
 G_DEFINE_FINAL_TYPE (BzSearchEngine, bz_search_engine, G_TYPE_OBJECT);
@@ -41,12 +43,19 @@ enum
 {
   PROP_0,
 
-  PROP_INTERNAL_CONFIG,
   PROP_MODEL,
+  PROP_BIASES,
 
   LAST_PROP
 };
 static GParamSpec *props[LAST_PROP] = { 0 };
+
+static void
+biases_changed (BzSearchEngine *self,
+                guint           position,
+                guint           removed,
+                guint           added,
+                GListModel     *model);
 
 static double
 test_strings (const char *query,
@@ -63,12 +72,6 @@ static gint
 cmp_scores (Score *a,
             Score *b);
 
-#define PERFECT        1.0
-#define ALMOST_PERFECT 0.95
-#define SAME_CLASS     0.2
-#define SAME_CLUSTER   0.1
-#define NO_MATCH       0.0
-
 enum
 {
   LINEAR,
@@ -79,6 +82,7 @@ BZ_DEFINE_DATA (
     bias,
     Bias,
     {
+      gboolean    invalid;
       GRegex     *regex;
       char       *convert_to;
       GHashTable *boost;
@@ -146,10 +150,13 @@ bz_search_engine_dispose (GObject *object)
 {
   BzSearchEngine *self = BZ_SEARCH_ENGINE (object);
 
-  g_clear_object (&self->internal_config);
-  g_clear_object (&self->model);
+  if (self->biases != NULL)
+    g_signal_handlers_disconnect_by_func (self->biases, biases_changed, self);
 
-  g_clear_pointer (&self->biases, g_ptr_array_unref);
+  g_clear_object (&self->model);
+  g_clear_object (&self->biases);
+
+  g_clear_pointer (&self->biases_mirror, g_ptr_array_unref);
 
   G_OBJECT_CLASS (bz_search_engine_parent_class)->dispose (object);
 }
@@ -164,11 +171,11 @@ bz_search_engine_get_property (GObject    *object,
 
   switch (prop_id)
     {
-    case PROP_INTERNAL_CONFIG:
-      g_value_set_object (value, bz_search_engine_get_internal_config (self));
-      break;
     case PROP_MODEL:
       g_value_set_object (value, bz_search_engine_get_model (self));
+      break;
+    case PROP_BIASES:
+      g_value_set_object (value, bz_search_engine_get_biases (self));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -185,11 +192,11 @@ bz_search_engine_set_property (GObject      *object,
 
   switch (prop_id)
     {
-    case PROP_INTERNAL_CONFIG:
-      bz_search_engine_set_internal_config (self, g_value_get_object (value));
-      break;
     case PROP_MODEL:
       bz_search_engine_set_model (self, g_value_get_object (value));
+      break;
+    case PROP_BIASES:
+      bz_search_engine_set_biases (self, g_value_get_object (value));
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -205,16 +212,16 @@ bz_search_engine_class_init (BzSearchEngineClass *klass)
   object_class->get_property = bz_search_engine_get_property;
   object_class->dispose      = bz_search_engine_dispose;
 
-  props[PROP_INTERNAL_CONFIG] =
-      g_param_spec_object (
-          "internal-config",
-          NULL, NULL,
-          BZ_TYPE_INTERNAL_CONFIG,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_EXPLICIT_NOTIFY);
-
   props[PROP_MODEL] =
       g_param_spec_object (
           "model",
+          NULL, NULL,
+          G_TYPE_LIST_MODEL,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_EXPLICIT_NOTIFY);
+
+  props[PROP_BIASES] =
+      g_param_spec_object (
+          "biases",
           NULL, NULL,
           G_TYPE_LIST_MODEL,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS | G_PARAM_EXPLICIT_NOTIFY);
@@ -225,7 +232,7 @@ bz_search_engine_class_init (BzSearchEngineClass *klass)
 static void
 bz_search_engine_init (BzSearchEngine *self)
 {
-  self->biases = g_ptr_array_new_with_free_func (bias_data_unref);
+  self->biases_mirror = g_ptr_array_new_with_free_func (bias_data_unref);
 }
 
 BzSearchEngine *
@@ -234,125 +241,40 @@ bz_search_engine_new (void)
   return g_object_new (BZ_TYPE_SEARCH_ENGINE, NULL);
 }
 
-BzInternalConfig *
-bz_search_engine_get_internal_config (BzSearchEngine *self)
+GListModel *
+bz_search_engine_get_biases (BzSearchEngine *self)
 {
   g_return_val_if_fail (BZ_IS_SEARCH_ENGINE (self), NULL);
-  return self->internal_config;
+  return self->biases;
 }
 
 void
-bz_search_engine_set_internal_config (BzSearchEngine   *self,
-                                      BzInternalConfig *internal_config)
+bz_search_engine_set_biases (BzSearchEngine *self,
+                             GListModel     *biases)
 {
   g_return_if_fail (BZ_IS_SEARCH_ENGINE (self));
-  g_return_if_fail (internal_config == NULL || BZ_IS_INTERNAL_CONFIG (internal_config));
+  g_return_if_fail (biases == NULL || G_IS_LIST_MODEL (biases));
 
-  g_clear_object (&self->internal_config);
-  g_ptr_array_set_size (self->biases, 0);
+  if (self->biases != NULL)
+    g_signal_handlers_disconnect_by_func (self->biases, biases_changed, self);
+  g_clear_object (&self->biases);
+  g_ptr_array_set_size (self->biases_mirror, 0);
 
-  if (internal_config != NULL)
+  if (biases != NULL)
     {
-      GListModel *biases   = NULL;
-      guint       n_biases = 0;
+      guint n_biases = 0;
 
-      self->internal_config = g_object_ref (internal_config);
+      self->biases = g_object_ref (biases);
 
-      biases = bz_internal_config_get_search_biases (internal_config);
-      if (biases != NULL)
-        n_biases = g_list_model_get_n_items (biases);
+      n_biases = g_list_model_get_n_items (biases);
+      biases_changed (self, 0, 0, n_biases, biases);
 
-      for (guint i = 0; i < n_biases; i++)
-        {
-          g_autoptr (GError) local_error              = NULL;
-          g_autoptr (BzSearchBias) bias               = NULL;
-          const char            *regex_string         = NULL;
-          const char            *convert_to           = NULL;
-          GListModel            *boost_appids         = NULL;
-          BzLinearFunction      *linear_function      = NULL;
-          BzExponentialFunction *exponential_function = NULL;
-          g_autoptr (GRegex) regex                    = NULL;
-          g_autoptr (GHashTable) boost                = NULL;
-          g_autoptr (BiasData) data                   = NULL;
-
-          bias                 = g_list_model_get_item (biases, i);
-          regex_string         = bz_search_bias_get_regex (bias);
-          convert_to           = bz_search_bias_get_convert_to (bias);
-          boost_appids         = bz_search_bias_get_boost_appids (bias);
-          linear_function      = bz_search_bias_get_linear_boost (bias);
-          exponential_function = bz_search_bias_get_exponential_boost (bias);
-          if (regex_string == NULL ||
-              (convert_to == NULL &&
-               (boost_appids == NULL ||
-                (linear_function == NULL &&
-                 exponential_function == NULL))))
-            {
-              g_critical ("Internal search bias is incomplete! Skipping...");
-              continue;
-            }
-          if (linear_function != NULL &&
-              exponential_function != NULL)
-            {
-              g_critical ("Search bias can only have one boost function! Skipping...");
-              continue;
-            }
-
-          regex = g_regex_new (
-              regex_string,
-              G_REGEX_OPTIMIZE,
-              G_REGEX_MATCH_DEFAULT,
-              &local_error);
-          if (regex == NULL)
-            {
-              g_critical ("Internal regex \"%s\" is invalid: %s",
-                          regex_string, local_error->message);
-              continue;
-            }
-
-          if (boost_appids != NULL)
-            {
-              guint n_appids = 0;
-
-              n_appids = g_list_model_get_n_items (boost_appids);
-              if (n_appids > 0)
-                {
-                  boost = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
-
-                  for (guint j = 0; j < n_appids; j++)
-                    {
-                      g_autoptr (GtkStringObject) string = NULL;
-                      const char *appid                  = NULL;
-
-                      string = g_list_model_get_item (boost_appids, j);
-                      appid  = gtk_string_object_get_string (string);
-                      g_hash_table_replace (boost, g_strdup (appid), NULL);
-                    }
-                }
-            }
-
-          data             = bias_data_new ();
-          data->regex      = g_regex_ref (regex);
-          data->convert_to = bz_maybe_strdup (convert_to);
-          data->boost      = bz_maybe_ref (boost, g_hash_table_ref);
-
-          if (linear_function != NULL)
-            {
-              data->boost_kind               = LINEAR;
-              data->linear_boost.slope       = bz_linear_function_get_slope (linear_function);
-              data->linear_boost.y_intercept = bz_linear_function_get_y_intercept (linear_function);
-            }
-          if (exponential_function != NULL)
-            {
-              data->boost_kind                    = EXPONENTIAL;
-              data->exponential_boost.factor      = bz_exponential_function_get_factor (exponential_function);
-              data->exponential_boost.y_intercept = bz_exponential_function_get_y_intercept (exponential_function);
-            }
-
-          g_ptr_array_add (self->biases, bias_data_ref (data));
-        }
+      g_signal_connect_swapped (
+          biases, "items-changed",
+          G_CALLBACK (biases_changed), self);
     }
 
-  g_object_notify_by_pspec (G_OBJECT (self), props[PROP_INTERNAL_CONFIG]);
+  g_object_notify_by_pspec (G_OBJECT (self), props[PROP_BIASES]);
 }
 
 GListModel *
@@ -432,13 +354,130 @@ bz_search_engine_query (BzSearchEngine    *self,
       data           = query_task_data_new ();
       data->terms    = g_strdupv ((gchar **) terms);
       data->snapshot = g_steal_pointer (&snapshot);
-      data->biases   = g_ptr_array_ref (self->biases);
+      data->biases   = g_ptr_array_ref (self->biases_mirror);
 
       return dex_scheduler_spawn (
           dex_thread_pool_scheduler_get_default (),
           bz_get_dex_stack_size (),
           (DexFiberFunc) query_task_fiber,
           query_task_data_ref (data), query_task_data_unref);
+    }
+}
+
+static void
+biases_changed (BzSearchEngine *self,
+                guint           position,
+                guint           removed,
+                guint           added,
+                GListModel     *model)
+{
+  if (removed > 0)
+    g_ptr_array_remove_range (self->biases_mirror, position, removed);
+
+  for (guint i = 0; i < added; i++)
+    {
+      g_autoptr (GError) local_error              = NULL;
+      g_autoptr (BzSearchBias) bias               = NULL;
+      const char            *regex_string         = NULL;
+      const char            *convert_to           = NULL;
+      GListModel            *boost_appids         = NULL;
+      BzLinearFunction      *linear_function      = NULL;
+      BzExponentialFunction *exponential_function = NULL;
+      g_autoptr (GRegex) regex                    = NULL;
+      g_autoptr (GHashTable) boost                = NULL;
+      g_autoptr (BiasData) data                   = NULL;
+
+      bias                 = g_list_model_get_item (model, position + i);
+      regex_string         = bz_search_bias_get_regex (bias);
+      convert_to           = bz_search_bias_get_convert_to (bias);
+      boost_appids         = bz_search_bias_get_boost_appids (bias);
+      linear_function      = bz_search_bias_get_linear_boost (bias);
+      exponential_function = bz_search_bias_get_exponential_boost (bias);
+
+#define SKIP()                                                                     \
+  G_STMT_START                                                                     \
+  {                                                                                \
+    g_autoptr (BiasData) _data = NULL;                                             \
+                                                                                   \
+    _data          = bias_data_new ();                                             \
+    _data->invalid = TRUE;                                                         \
+    g_ptr_array_insert (self->biases_mirror, position + i, bias_data_ref (_data)); \
+  }                                                                                \
+  G_STMT_END
+
+      if (regex_string == NULL ||
+          (convert_to == NULL &&
+           (boost_appids == NULL ||
+            (linear_function == NULL &&
+             exponential_function == NULL))))
+        {
+          g_critical ("Bias is incomplete! Skipping...");
+          SKIP ();
+          continue;
+        }
+      if (linear_function != NULL &&
+          exponential_function != NULL)
+        {
+          g_critical ("Search bias can only have one boost function! Skipping...");
+          SKIP ();
+          continue;
+        }
+
+      regex = g_regex_new (
+          regex_string,
+          G_REGEX_OPTIMIZE,
+          G_REGEX_MATCH_DEFAULT,
+          &local_error);
+      if (regex == NULL)
+        {
+          g_critical ("Bias regex \"%s\" is invalid: %s",
+                      regex_string, local_error->message);
+          SKIP ();
+          continue;
+        }
+
+#undef SKIP
+
+      if (boost_appids != NULL)
+        {
+          guint n_appids = 0;
+
+          n_appids = g_list_model_get_n_items (boost_appids);
+          if (n_appids > 0)
+            {
+              boost = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+              for (guint j = 0; j < n_appids; j++)
+                {
+                  g_autoptr (GtkStringObject) string = NULL;
+                  const char *appid                  = NULL;
+
+                  string = g_list_model_get_item (boost_appids, j);
+                  appid  = gtk_string_object_get_string (string);
+                  g_hash_table_replace (boost, g_strdup (appid), NULL);
+                }
+            }
+        }
+
+      data             = bias_data_new ();
+      data->regex      = g_regex_ref (regex);
+      data->convert_to = bz_maybe_strdup (convert_to);
+      data->boost      = bz_maybe_ref (boost, g_hash_table_ref);
+
+      if (linear_function != NULL)
+        {
+          data->boost_kind               = LINEAR;
+          data->linear_boost.slope       = bz_linear_function_get_slope (linear_function);
+          data->linear_boost.y_intercept = bz_linear_function_get_y_intercept (linear_function);
+        }
+      if (exponential_function != NULL)
+        {
+          data->boost_kind                    = EXPONENTIAL;
+          data->exponential_boost.factor      = bz_exponential_function_get_factor (exponential_function);
+          data->exponential_boost.y_intercept = bz_exponential_function_get_y_intercept (exponential_function);
+        }
+
+      g_ptr_array_insert (self->biases_mirror, position + i, bias_data_ref (data));
     }
 }
 
@@ -466,11 +505,14 @@ query_task_fiber (QueryTaskData *data)
   active_biases = g_ptr_array_new_with_free_func (bias_data_unref);
   if (biases->len > 0)
     {
-      for (guint j = 0; j < biases->len; j++)
+      for (guint i = 0; i < biases->len; i++)
         {
           BiasData *bias = NULL;
 
-          bias = g_ptr_array_index (biases, j);
+          bias = g_ptr_array_index (biases, i);
+          if (bias->invalid)
+            continue;
+
           if (!g_regex_match (bias->regex, query_utf8, G_REGEX_MATCH_DEFAULT, NULL))
             continue;
 

@@ -96,6 +96,7 @@ struct _BzApplication
   GHashTable                 *usr_name_to_addons;
   GListStore                 *groups;
   GListStore                 *installed_apps;
+  GListStore                 *search_biases_backing;
   GNetworkMonitor            *network;
   GPtrArray                  *blocklist_regexes;
   GPtrArray                  *txt_blocked_id_sets;
@@ -105,6 +106,7 @@ struct _BzApplication
   GtkCustomFilter            *appid_filter;
   GtkCustomFilter            *group_filter;
   GtkFilterListModel         *group_filter_model;
+  GtkFlattenListModel        *search_biases;
   GtkMapListModel            *blocklists_to_files;
   GtkMapListModel            *curated_configs_to_files;
   GtkMapListModel            *txt_blocklists_to_files;
@@ -349,6 +351,8 @@ bz_application_dispose (GObject *object)
   g_clear_object (&self->installed_apps);
   g_clear_object (&self->internal_config);
   g_clear_object (&self->network);
+  g_clear_object (&self->search_biases);
+  g_clear_object (&self->search_biases_backing);
   g_clear_object (&self->search_engine);
   g_clear_object (&self->settings);
   g_clear_object (&self->state);
@@ -2611,6 +2615,27 @@ init_service_struct (BzApplication *self,
       self->curated_configs_to_files,
       G_LIST_MODEL (self->curated_configs));
 
+  self->search_biases         = gtk_flatten_list_model_new (NULL);
+  self->search_biases_backing = g_list_store_new (G_TYPE_LIST_MODEL);
+  {
+    GListModel *main_config_search_biases     = NULL;
+    GListModel *internal_config_search_biases = NULL;
+
+    if (self->config != NULL)
+      main_config_search_biases = bz_main_config_get_search_biases (self->config);
+
+    internal_config_search_biases = bz_internal_config_get_search_biases (self->internal_config);
+
+    /* Main config biases take precedence over the hardcoded ones */
+    if (main_config_search_biases != NULL)
+      g_list_store_append (self->search_biases_backing, main_config_search_biases);
+    if (internal_config_search_biases != NULL)
+      g_list_store_append (self->search_biases_backing, internal_config_search_biases);
+  }
+  gtk_flatten_list_model_set_model (
+      self->search_biases,
+      G_LIST_MODEL (self->search_biases_backing));
+
   g_type_ensure (BZ_TYPE_ROOT_BLOCKLIST);
   g_type_ensure (BZ_TYPE_BLOCKLIST);
   g_type_ensure (BZ_TYPE_BLOCKLIST_CONDITION);
@@ -2765,8 +2790,8 @@ init_service_struct (BzApplication *self,
       g_object_ref (GTK_FILTER (self->group_filter)));
 
   self->search_engine = bz_search_engine_new ();
-  bz_search_engine_set_internal_config (self->search_engine, self->internal_config);
   bz_search_engine_set_model (self->search_engine, G_LIST_MODEL (self->group_filter_model));
+  bz_search_engine_set_biases (self->search_engine, G_LIST_MODEL (self->search_biases));
   bz_gnome_shell_search_provider_set_engine (self->gs_search, self->search_engine);
 
   self->curated_provider = bz_content_provider_new ();
