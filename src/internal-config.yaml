@@ -17,7 +17,7 @@ search-biases:
       - org.torproject.torbrowser-launcher
     linear-boost:
       slope: 1.333
-      y-intercept: 25.0
+      y-intercept: 40.0
 
   - regex: \b(?i)vm\b
     convert-to: virtual machine
